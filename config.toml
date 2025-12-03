@@ -1,0 +1,80 @@
+# ========================================
+# SunRush Host Configuration
+# ========================================
+
+[host]
+# Plugin directory
+plugin_dir = "./plugins"
+
+# Message bus capacity (per channel)
+bus_capacity = 10000
+
+# Enable hot reload
+hot_reload = true
+
+# Worker threads (0 = number of CPU cores)
+worker_threads = 0
+
+# ========================================
+# Telemetry
+# ========================================
+
+[telemetry]
+# Enable Prometheus metrics endpoint
+enabled = true
+
+# Metrics HTTP server port
+port = 9090
+
+# Bind address
+bind = "0.0.0.0"
+
+# ========================================
+# Logging
+# ========================================
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+
+# Log format: json, pretty, compact
+format = "json"
+
+# Log output: stdout, file
+output = "stdout"
+
+# ========================================
+# Plugin: ShredIngest (Example)
+# ========================================
+
+[plugins.shred_ingest]
+# Jito ShredStream endpoint
+jito_endpoint = "grpc://shredstream.jito.wtf:10000"
+
+# Authentication token
+auth_token = "${JITO_AUTH_TOKEN}"
+
+# Connection timeout (seconds)
+connection_timeout = 30
+
+# ========================================
+# Plugin: BlockAssembler (Example)
+# ========================================
+
+[plugins.block_assembler]
+# Maximum slots to keep in memory
+max_slots_in_memory = 100
+
+# Slot timeout (milliseconds)
+slot_timeout_ms = 5000
+
+# ========================================
+# Plugin: TxExtractor (Example)
+# ========================================
+
+[plugins.tx_extractor]
+# Number of decode worker tasks
+max_decode_workers = 4
+
+# Enable parallel processing
+parallel_processing = true

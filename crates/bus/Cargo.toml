@@ -1,0 +1,10 @@
+[package]
+name = "sunrush-bus"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+sunrush-types = { path = "../types" }
+tokio = { version = "1.40", features = ["sync", "time"] }
+tracing = "0.1"
+thiserror = "1.0"
