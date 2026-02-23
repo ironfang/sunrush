@@ -1,8 +1,8 @@
 [workspace]
-members = [
-    "crates/host",
-    "crates/abi",
-    "crates/types",
-    "crates/bus",
-]
-resolver = "2"
+resolver = "3"
+members = ["core/abi", "host", "test_plugin"]
+
+[workspace.dependencies]
+tokio = { version = "1.49", features = ["full"] }
+serde = "1.0.228"
+toml = "1.0.3"
