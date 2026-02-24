@@ -1,4 +1,43 @@
-use crate::BusEvent;
+// ---------------------------------------------------------------------------
+// BusEvent — trait for typed messages
+// ---------------------------------------------------------------------------
+
+/// Implement this for any struct you want to send on the bus.
+///
+/// Default implementations of `encode` and `decode` use a plain bitwise
+/// copy (`repr(C)` + `Copy` guarantees this is safe and deterministic).
+/// Override them only if you need custom serialization.
+pub trait BusEvent: Copy + Send + Sync + 'static {
+    /// The topic this event type is always published on.
+    const TOPIC: &'static str;
+
+    /// Encode `self` into owned bytes.
+    ///
+    /// Default: reinterprets the value as raw bytes — zero allocation,
+    /// zero copy.  Only correct for fully-initialized `#[repr(C)]` types
+    /// with no padding bytes containing undefined values.
+    fn encode(&self) -> Box<[u8]> {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
+        };
+        bytes.into()
+    }
+
+    /// Decode from bytes.
+    ///
+    /// Default: copies bytes into a new `Self` using an unaligned read.
+    /// Returns `None` if the slice is shorter than `size_of::<Self>()`.
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < std::mem::size_of::<Self>() {
+            return None;
+        }
+        // SAFETY: length checked above; read_unaligned handles any alignment.
+        Some(unsafe { (bytes.as_ptr() as *const Self).read_unaligned() })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Messages
@@ -62,5 +101,24 @@ mod tests {
         assert_eq!(p.name_len as usize, short.len());
         assert_eq!(p.name(), short);
         assert_eq!(p.name.len(), MAX_NAME_LEN);
+    }
+
+    #[test]
+    fn bus_event_encode() {
+        let event = TestPayload::new(42, 1.0, 2.0, "test");
+        let encoded = event.encode();
+        assert_eq!(encoded.len(), std::mem::size_of::<TestPayload>());
+    }
+
+    #[test]
+    fn bus_event_encode_decode() {
+        let event = TestPayload::new(42, 1.0, 2.0, "test");
+        let encoded = event.encode();
+        let decoded = TestPayload::decode(&encoded).unwrap();
+        assert_eq!(decoded.id, event.id);
+        assert_eq!(decoded.x, event.x);
+        assert_eq!(decoded.y, event.y);
+        assert_eq!(decoded.name_len, event.name_len);
+        assert_eq!(decoded.name(), event.name());
     }
 }
