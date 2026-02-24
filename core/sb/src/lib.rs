@@ -13,13 +13,20 @@ const CHANNEL_CAPACITY: usize = 256;
 
 /// A message travelling on the bus.
 ///
-/// Cheaply cloneable — the payload is reference-counted.
-#[derive(Clone, Debug)]
+/// The bus takes ownership once and wraps it in an `Arc`.  Subscribers
+/// receive an `Arc<BusMessage>` — a single atomic increment per subscriber,
+/// no data copies.  The message is freed automatically when the last
+/// subscriber handler drops its `Arc`.
+#[derive(Debug)]
 pub struct BusMessage {
     /// The topic this message was published on.
-    pub topic: Arc<str>,
+    ///
+    /// Topics are expected to be a small set of compile-time constants, so a
+    /// plain `&'static str` — a pointer + length into the binary — is the
+    /// cheapest possible representation: no heap allocation, no ref-counting.
+    pub topic: &'static str,
     /// The raw payload bytes.
-    pub data: Arc<[u8]>,
+    pub data: Box<[u8]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -27,7 +34,7 @@ pub struct BusMessage {
 // ---------------------------------------------------------------------------
 
 struct TopicChannel {
-    sender: broadcast::Sender<BusMessage>,
+    sender: broadcast::Sender<Arc<BusMessage>>,
 }
 
 /// The service bus.
@@ -37,7 +44,7 @@ struct TopicChannel {
 /// subscriber tasks.
 #[derive(Clone, Default)]
 pub struct Bus {
-    topics: Arc<Mutex<HashMap<String, TopicChannel>>>,
+    topics: Arc<Mutex<HashMap<&'static str, TopicChannel>>>,
 }
 
 impl Bus {
@@ -51,13 +58,9 @@ impl Bus {
     /// If the topic's channel does not exist yet it is created now.
     /// Multiple calls with the same topic name return publishers that all
     /// share the same underlying broadcast channel.
-    pub fn publisher(&self, topic: impl Into<String>) -> Publisher {
-        let topic = topic.into();
-        let sender = self.get_or_create(&topic);
-        Publisher {
-            sender,
-            topic: Arc::from(topic.as_str()),
-        }
+    pub fn publisher(&self, topic: &'static str) -> Publisher {
+        let sender = self.get_or_create(topic);
+        Publisher { sender, topic }
     }
 
     /// Subscribe to `topic` with an async handler.
@@ -66,13 +69,12 @@ impl Bus {
     /// never blocks the publisher or any other subscriber.  If the subscriber
     /// falls behind the channel capacity it will log a warning and continue
     /// from the newest available message.
-    pub fn subscribe<F, Fut>(&self, topic: impl Into<String>, handler: F)
+    pub fn subscribe<F, Fut>(&self, topic: &'static str, handler: F)
     where
-        F: Fn(BusMessage) -> Fut + Send + 'static,
+        F: Fn(Arc<BusMessage>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let topic = topic.into();
-        let sender = self.get_or_create(&topic);
+        let sender = self.get_or_create(topic);
         let mut rx = sender.subscribe();
 
         tokio::spawn(async move {
@@ -99,9 +101,9 @@ impl Bus {
 
     // --- internal helpers ---------------------------------------------------
 
-    fn get_or_create(&self, topic: &str) -> broadcast::Sender<BusMessage> {
+    fn get_or_create(&self, topic: &'static str) -> broadcast::Sender<Arc<BusMessage>> {
         let mut map = self.topics.lock().unwrap();
-        map.entry(topic.to_owned())
+        map.entry(topic)
             .or_insert_with(|| {
                 let (tx, _) = broadcast::channel(CHANNEL_CAPACITY);
                 TopicChannel { sender: tx }
@@ -120,8 +122,8 @@ impl Bus {
 /// Obtained via [`Bus::publisher`].  Cheap to clone.
 #[derive(Clone)]
 pub struct Publisher {
-    sender: broadcast::Sender<BusMessage>,
-    topic: Arc<str>,
+    sender: broadcast::Sender<Arc<BusMessage>>,
+    topic: &'static str,
 }
 
 impl Publisher {
@@ -129,17 +131,23 @@ impl Publisher {
     ///
     /// Returns the number of subscribers that received the message.
     /// Returns `0` when there are no subscribers — this is not an error.
-    pub fn publish(&self, data: impl Into<Vec<u8>>) -> usize {
-        let msg = BusMessage {
-            topic: Arc::clone(&self.topic),
-            data: Arc::from(data.into().as_slice()),
-        };
+    ///
+    /// Accepts any type that converts into `Box<[u8]>` without an extra
+    /// allocation: `Box<[u8]>` (zero-cost move), `Vec<u8>` (moves the
+    /// underlying allocation, reallocates only when `len < capacity`).
+    /// Passing a `&[u8]` requires a copy — that is unavoidable because
+    /// ownership must be transferred to the message.
+    pub fn publish(&self, data: impl Into<Box<[u8]>>) -> usize {
+        let msg = Arc::new(BusMessage {
+            topic: self.topic,
+            data: data.into(),
+        });
         self.sender.send(msg).unwrap_or(0)
     }
 
     /// The topic name this publisher sends on.
-    pub fn topic(&self) -> &str {
-        &self.topic
+    pub fn topic(&self) -> &'static str {
+        self.topic
     }
 }
 
@@ -161,7 +169,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let c = Arc::clone(&counter);
 
-        bus.subscribe("events", move |msg: BusMessage| {
+        bus.subscribe("events", move |msg: Arc<BusMessage>| {
             let c = Arc::clone(&c);
             async move {
                 assert_eq!(&*msg.data, b"hello");
@@ -186,7 +194,7 @@ mod tests {
 
         for _ in 0..3 {
             let h = Arc::clone(&hits);
-            bus.subscribe("topic", move |_msg: BusMessage| {
+            bus.subscribe("topic", move |_msg: Arc<BusMessage>| {
                 let h = Arc::clone(&h);
                 async move {
                     h.fetch_add(1, Ordering::SeqCst);
@@ -217,7 +225,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let c = Arc::clone(&counter);
 
-        bus.subscribe("stream", move |_msg: BusMessage| {
+        bus.subscribe("stream", move |_msg: Arc<BusMessage>| {
             let c = Arc::clone(&c);
             async move {
                 c.fetch_add(1, Ordering::SeqCst);

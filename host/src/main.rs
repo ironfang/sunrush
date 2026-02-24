@@ -3,7 +3,30 @@ use abi::{
     host_contract::{BusCallback, HostApi},
     plugin_contract::PluginApi,
 };
+use std::sync::Arc;
 use sb::{Bus, BusMessage};
+
+// ---------------------------------------------------------------------------
+// Topic interning
+//
+// Topics arrive from plugins as runtime C strings.  We intern each unique
+// topic string exactly once by leaking a Box<str>, converting it to
+// `&'static str`.  With ~5 topics this is negligible.
+// ---------------------------------------------------------------------------
+
+fn intern_topic(s: &str) -> &'static str {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static TABLE: Mutex<Option<HashMap<String, &'static str>>> = Mutex::new(None);
+    let mut guard = TABLE.lock().unwrap();
+    let map = guard.get_or_insert_with(HashMap::new);
+    if let Some(&existing) = map.get(s) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
+    map.insert(s.to_owned(), leaked);
+    leaked
+}
 use libloading::{Library, Symbol};
 
 // ---------------------------------------------------------------------------
@@ -24,8 +47,9 @@ extern "C" fn bus_publish(
 ) {
     let bus = unsafe { &*(bus_ctx as *const Bus) };
     let topic_str = unsafe { CStr::from_ptr(topic) }.to_str().unwrap_or("");
+    let topic_static = intern_topic(topic_str);
     let payload = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
-    bus.publisher(topic_str).publish(payload);
+    bus.publisher(topic_static).publish(payload);
 }
 
 /// Subscribe to a topic.  The callback is invoked from a dedicated async task.
@@ -35,16 +59,13 @@ extern "C" fn bus_subscribe(
     callback: BusCallback,
 ) {
     let bus = unsafe { &*(bus_ctx as *const Bus) };
-    let topic_owned = unsafe { CStr::from_ptr(topic) }
-        .to_str()
-        .unwrap_or("")
-        .to_owned();
+    let topic_static = intern_topic(
+        unsafe { CStr::from_ptr(topic) }.to_str().unwrap_or("")
+    );
 
-    bus.subscribe(topic_owned.clone(), move |msg: BusMessage| {
-        let topic_owned = topic_owned.clone();
+    bus.subscribe(topic_static, move |msg: Arc<BusMessage>| {
         async move {
-            // Both pointers are valid only inside this async block — safe.
-            let topic_cstr = CString::new(topic_owned).unwrap();
+            let topic_cstr = CString::new(msg.topic).unwrap();
             callback(topic_cstr.as_ptr(), msg.data.as_ptr(), msg.data.len());
         }
     });
