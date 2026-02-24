@@ -5,7 +5,50 @@ use std::{
 };
 use tokio::sync::broadcast;
 
+pub mod messages;
+
 const CHANNEL_CAPACITY: usize = 256;
+
+// ---------------------------------------------------------------------------
+// BusEvent — trait for typed messages
+// ---------------------------------------------------------------------------
+
+/// Implement this for any struct you want to send on the bus.
+///
+/// Default implementations of `encode` and `decode` use a plain bitwise
+/// copy (`repr(C)` + `Copy` guarantees this is safe and deterministic).
+/// Override them only if you need custom serialization.
+pub trait BusEvent: Copy + Send + Sync + 'static {
+    /// The topic this event type is always published on.
+    const TOPIC: &'static str;
+
+    /// Encode `self` into owned bytes.
+    ///
+    /// Default: reinterprets the value as raw bytes — zero allocation,
+    /// zero copy.  Only correct for fully-initialized `#[repr(C)]` types
+    /// with no padding bytes containing undefined values.
+    fn encode(&self) -> Box<[u8]> {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                self as *const Self as *const u8,
+                std::mem::size_of::<Self>(),
+            )
+        };
+        bytes.into()
+    }
+
+    /// Decode from bytes.
+    ///
+    /// Default: copies bytes into a new `Self` using an unaligned read.
+    /// Returns `None` if the slice is shorter than `size_of::<Self>()`.
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < std::mem::size_of::<Self>() {
+            return None;
+        }
+        // SAFETY: length checked above; read_unaligned handles any alignment.
+        Some(unsafe { (bytes.as_ptr() as *const Self).read_unaligned() })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // BusMessage
@@ -63,6 +106,37 @@ impl Bus {
         Publisher { sender, topic }
     }
 
+    /// Return a typed [`TypedPublisher<T>`] for `T::TOPIC`.
+    ///
+    /// The topic is taken from the `BusEvent` impl — no stringly-typed input.
+    pub fn typed_publisher<T: BusEvent>(&self) -> TypedPublisher<T> {
+        TypedPublisher {
+            inner: self.publisher(T::TOPIC),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Subscribe to `T::TOPIC` with a typed async handler.
+    ///
+    /// Payloads that fail to decode are silently skipped.
+    pub fn subscribe_typed<T, F, Fut>(&self, handler: F)
+    where
+        T: BusEvent,
+        F: Fn(T) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let handler = Arc::new(handler);
+        self.subscribe(T::TOPIC, move |msg: Arc<BusMessage>| {
+            let decoded = T::decode(&msg.data);
+            let handler = Arc::clone(&handler);
+            async move {
+                if let Some(event) = decoded {
+                    handler(event).await;
+                }
+            }
+        });
+    }
+
     /// Subscribe to `topic` with an async handler.
     ///
     /// A dedicated tokio task is spawned for this subscriber, so the handler
@@ -110,6 +184,26 @@ impl Bus {
             })
             .sender
             .clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TypedPublisher
+// ---------------------------------------------------------------------------
+
+/// A strongly-typed publish handle for events of type `T: BusEvent`.
+///
+/// Obtained via [`Bus::typed_publisher`].  Encodes `T` and forwards
+/// the bytes to the underlying [`Publisher`].
+pub struct TypedPublisher<T: BusEvent> {
+    inner: Publisher,
+    _marker: std::marker::PhantomData<fn(T)>,
+}
+
+impl<T: BusEvent> TypedPublisher<T> {
+    /// Encode and publish `event`.  Returns the subscriber count.
+    pub fn publish(&self, event: &T) -> usize {
+        self.inner.publish(event.encode())
     }
 }
 
@@ -240,5 +334,31 @@ mod tests {
 
         sleep(Duration::from_millis(50)).await;
         assert_eq!(counter.load(Ordering::SeqCst), 10);
+    }
+
+    #[tokio::test]
+    async fn typed_publisher_and_subscriber() {
+        use crate::messages::TestPayload;
+
+        let bus = Bus::new();
+        let publisher = bus.typed_publisher::<TestPayload>();
+
+        let received_id = Arc::new(AtomicUsize::new(0));
+        let r = Arc::clone(&received_id);
+
+        bus.subscribe_typed::<TestPayload, _, _>(move |msg: TestPayload| {
+            let r = Arc::clone(&r);
+            async move {
+                assert!((msg.x - 1.0_f32).abs() < f32::EPSILON);
+                assert_eq!(msg.name(), "hero");
+                r.store(msg.id as usize, Ordering::SeqCst);
+            }
+        });
+
+        tokio::task::yield_now().await;
+        publisher.publish(&TestPayload::new(42, 1.0, 2.0, "hero"));
+
+        sleep(Duration::from_millis(50)).await;
+        assert_eq!(received_id.load(Ordering::SeqCst), 42);
     }
 }
