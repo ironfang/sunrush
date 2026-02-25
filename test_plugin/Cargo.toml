@@ -8,3 +8,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 abi = { path = "../core/abi" }
+sb  = { path = "../core/sb" }

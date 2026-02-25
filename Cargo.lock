@@ -5,6 +5,10 @@ version = 4
 [[package]]
 name = "abi"
 version = "0.1.0"
+dependencies = [
+ "sb",
+ "tokio",
+]
 
 [[package]]
 name = "bitflags"
@@ -253,6 +257,7 @@ name = "test_plugin"
 version = "0.1.0"
 dependencies = [
  "abi",
+ "sb",
 ]
 
 [[package]]

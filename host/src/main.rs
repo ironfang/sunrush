@@ -1,93 +1,27 @@
-use std::ffi::{CStr, CString, c_void};
+use std::ffi::CStr;
 use abi::{
-    host_contract::{BusCallback, HostApi},
+    host_contract::HostApi,
     plugin_contract::PluginApi,
 };
-use std::sync::Arc;
-use sb::{Bus, BusMessage};
-
-// ---------------------------------------------------------------------------
-// Topic interning
-//
-// Topics arrive from plugins as runtime C strings.  We intern each unique
-// topic string exactly once by leaking a Box<str>, converting it to
-// `&'static str`.  With ~5 topics this is negligible.
-// ---------------------------------------------------------------------------
-
-fn intern_topic(s: &str) -> &'static str {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    static TABLE: Mutex<Option<HashMap<String, &'static str>>> = Mutex::new(None);
-    let mut guard = TABLE.lock().unwrap();
-    let map = guard.get_or_insert_with(HashMap::new);
-    if let Some(&existing) = map.get(s) {
-        return existing;
-    }
-    let leaked: &'static str = Box::leak(s.to_owned().into_boxed_str());
-    map.insert(s.to_owned(), leaked);
-    leaked
-}
 use libloading::{Library, Symbol};
+use sb::messages::TestPayload;
+use host_contract_impl::init;
 
-// ---------------------------------------------------------------------------
-// Host-side callbacks exposed to plugins via HostApi
-// ---------------------------------------------------------------------------
-
-extern "C" fn host_print(_ctx: *mut c_void, msg: *const std::ffi::c_char) {
-    let s = unsafe { CStr::from_ptr(msg) }.to_string_lossy();
-    println!("[plugin] {}", s);
-}
-
-/// Publish bytes on a topic.  `bus_ctx` is a `*mut Bus` cast to `*mut c_void`.
-extern "C" fn bus_publish(
-    bus_ctx: *mut c_void,
-    topic: *const std::ffi::c_char,
-    data: *const u8,
-    len: usize,
-) {
-    let bus = unsafe { &*(bus_ctx as *const Bus) };
-    let topic_str = unsafe { CStr::from_ptr(topic) }.to_str().unwrap_or("");
-    let topic_static = intern_topic(topic_str);
-    let payload = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
-    bus.publisher(topic_static).publish(payload);
-}
-
-/// Subscribe to a topic.  The callback is invoked from a dedicated async task.
-extern "C" fn bus_subscribe(
-    bus_ctx: *mut c_void,
-    topic: *const std::ffi::c_char,
-    callback: BusCallback,
-) {
-    let bus = unsafe { &*(bus_ctx as *const Bus) };
-    let topic_static = intern_topic(
-        unsafe { CStr::from_ptr(topic) }.to_str().unwrap_or("")
-    );
-
-    bus.subscribe(topic_static, move |msg: Arc<BusMessage>| {
-        async move {
-            let topic_cstr = CString::new(msg.topic).unwrap();
-            callback(topic_cstr.as_ptr(), msg.data.as_ptr(), msg.data.len());
-        }
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Entry point
-// ---------------------------------------------------------------------------
+mod host_contract_impl;
 
 #[tokio::main]
 async fn main() {
-    // The Bus is heap-allocated; its raw pointer is passed to plugins as bus_ctx.
-    let bus = Box::new(Bus::new());
-    let bus_ptr = Box::into_raw(bus);
+    let host_api = init();
 
-    let host_api = HostApi {
-        host_ctx: std::ptr::null_mut(),
-        host_print,
-        bus_ctx: bus_ptr as *mut c_void,
-        bus_publish,
-        bus_subscribe,
-    };
+    // Subscribe before any plugin is loaded so no events are missed.
+    host_api.subscribe(|event: TestPayload| async move {
+        println!(
+            "[host] received TestPayload: id={} x={:.2} y={:.2} name=\"{}\"",
+            event.id, event.x, event.y, event.name()
+        );
+    });
+
+    println!("Starting host...");
 
     unsafe {
         let lib = Library::new("./target/debug/libtest_plugin.so").unwrap();
@@ -100,13 +34,19 @@ async fn main() {
 
         (api.load)(&host_api as *const HostApi);
 
-        // ... plugin does its work here ...
+        // Two yields are needed:
+        //   1st — lets the bus subscriber task receive the message and call
+        //         dispatch_trampoline (which calls tokio::spawn for the handler).
+        //   2nd — lets that newly spawned handler task actually run.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        println!("Host running. Press Ctrl+C to stop.");
+        tokio::signal::ctrl_c().await.expect("failed to listen for Ctrl+C");
+        println!("Shutting down...");
 
         (api.unload)();
 
         std::mem::forget(lib);
-
-        // Reclaim the Bus after all plugins are unloaded.
-        drop(Box::from_raw(bus_ptr));
     }
 }

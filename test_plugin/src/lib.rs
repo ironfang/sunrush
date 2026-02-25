@@ -1,5 +1,6 @@
 use std::ffi::c_char;
 use abi::{host_contract::HostApi, plugin_contract::PluginApi};
+use sb::messages::TestPayload;
 
 #[unsafe(no_mangle)]
 pub static PLUGIN_API: PluginApi = PluginApi {
@@ -9,13 +10,17 @@ pub static PLUGIN_API: PluginApi = PluginApi {
 };
 
 extern "C" fn get_name() -> *const c_char {
-    // static string lives forever → safe
-    static NAME: &str = "SunRush Demo Привет";
-    NAME.as_ptr() as *const c_char
+    // c"..." literals are null-terminated; .as_ptr() is valid for 'static.
+    c"SunRush Demo Привет".as_ptr()
 }
 
-extern "C" fn load(_host: *const HostApi) {
-    // TODO: store host pointer and initialise plugin state
+extern "C" fn load(host: *const HostApi) {
+    // SAFETY: the host guarantees the pointer is valid and non-null for the
+    // lifetime of the `load` call.
+    let host = unsafe { &*host };
+
+    let payload = TestPayload::new(1, 3.14, 2.71, "hello from test_plugin");
+    host.publish(payload);
 }
 
 extern "C" fn unload() {
