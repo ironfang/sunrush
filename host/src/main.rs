@@ -1,4 +1,7 @@
 use std::ffi::CStr;
+use std::mem::size_of;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use abi::{
     host_contract::HostApi,
     plugin_contract::PluginApi,
@@ -9,16 +12,34 @@ use host_contract_impl::init;
 
 mod host_contract_impl;
 
+static MSG_COUNT:  AtomicU64 = AtomicU64::new(0);
+static BYTE_COUNT: AtomicU64 = AtomicU64::new(0);
+
 #[tokio::main]
 async fn main() {
     let host_api = init();
 
-    // Subscribe before any plugin is loaded so no events are missed.
-    host_api.subscribe(|event: TestPayload| async move {
-        println!(
-            "[host] received TestPayload: id={} x={:.2} y={:.2} name=\"{}\"",
-            event.id, event.x, event.y, event.name()
-        );
+    // Count every arriving TestPayload for bandwidth stats.
+    host_api.subscribe(|_event: TestPayload| async move {
+        MSG_COUNT .fetch_add(1,                             Ordering::Relaxed);
+        BYTE_COUNT.fetch_add(size_of::<TestPayload>() as u64, Ordering::Relaxed);
+    });
+
+    // Print msg/s and B/s every second.
+    tokio::spawn(async {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.tick().await; // first tick fires immediately — skip it
+        loop {
+            interval.tick().await;
+            let msgs  = MSG_COUNT .swap(0, Ordering::Relaxed);
+            let bytes = BYTE_COUNT.swap(0, Ordering::Relaxed);
+            println!(
+                "[bandwidth] {:>10} msg/s  |  {:>12} B/s  ({:.2} MB/s)",
+                msgs,
+                bytes,
+                bytes as f64 / 1_000_000.0,
+            );
+        }
     });
 
     println!("Starting host...");

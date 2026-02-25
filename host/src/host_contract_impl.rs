@@ -44,9 +44,13 @@ extern "C" fn bus_subscribe(
         unsafe { CStr::from_ptr(topic) }.to_str().unwrap_or("")
     );
 
+    // Leak a CString for this topic so the pointer is valid for 'static.
+    // Subscriptions are permanent, so this tiny allocation is intentional.
+    let topic_cstr: &'static std::ffi::CStr =
+        Box::leak(CString::new(topic_static).expect("topic has null byte").into_boxed_c_str());
+
     bus.subscribe(topic_static, move |msg: Arc<BusMessage>| {
         async move {
-            let topic_cstr = CString::new(msg.topic).unwrap();
             callback(topic_cstr.as_ptr(), msg.data.as_ptr(), msg.data.len());
         }
     });

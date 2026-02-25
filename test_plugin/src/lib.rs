@@ -1,4 +1,5 @@
 use std::ffi::c_char;
+use std::sync::atomic::{AtomicBool, Ordering};
 use abi::{host_contract::HostApi, plugin_contract::PluginApi};
 use sb::messages::TestPayload;
 
@@ -9,20 +10,28 @@ pub static PLUGIN_API: PluginApi = PluginApi {
     unload,
 };
 
+/// Signals the publisher thread to stop.
+static STOP: AtomicBool = AtomicBool::new(false);
+
 extern "C" fn get_name() -> *const c_char {
-    // c"..." literals are null-terminated; .as_ptr() is valid for 'static.
     c"SunRush Demo Привет".as_ptr()
 }
 
 extern "C" fn load(host: *const HostApi) {
-    // SAFETY: the host guarantees the pointer is valid and non-null for the
-    // lifetime of the `load` call.
-    let host = unsafe { &*host };
-
-    let payload = TestPayload::new(1, 3.14, 2.71, "hello from test_plugin");
-    host.publish(payload);
+    STOP.store(false, Ordering::SeqCst);
+    // Cast to usize so the closure captures a Send integer rather than a raw
+    // pointer (Rust 2024 captures individual fields, so *const T is !Send).
+    let host_ptr = host as usize;
+    std::thread::spawn(move || {
+        let host = unsafe { &*(host_ptr as *const HostApi) };
+        let mut seq: u32 = 0;
+        while !STOP.load(Ordering::Relaxed) {
+            host.publish(TestPayload::new(seq, 0.0, 0.0, "bw"));
+            seq = seq.wrapping_add(1);
+        }
+    });
 }
 
 extern "C" fn unload() {
-    // TODO: release plugin resources
+    STOP.store(true, Ordering::SeqCst);
 }

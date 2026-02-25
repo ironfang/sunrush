@@ -4,7 +4,7 @@ use std::{
     ffi::{CStr, CString},
     future::Future,
     os::raw::{c_char, c_void},
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Mutex, OnceLock},
 };
 
 pub type BusCallback = extern "C" fn(topic: *const c_char, data: *const u8, len: usize);
@@ -62,26 +62,32 @@ impl HostApi {
 
     /// Subscribe to bus events of type `T`.
     ///
-    /// The `handler` closure is stored in a global registry keyed by
-    /// `T::TOPIC`.  The host is given a single `extern "C"` trampoline
-    /// (`dispatch_trampoline`) that routes raw payloads to the correct handler.
+    /// A single dedicated tokio task is spawned per topic.  The trampoline
+    /// sends raw payload bytes onto an mpsc channel; the task drains it and
+    /// calls the handler.  This avoids a `tokio::spawn` + `Arc::clone` on
+    /// every received message.
     pub fn subscribe<T, F, Fut>(&self, handler: F)
     where
         T: BusEvent,
         F: Fn(T) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        let handler = Arc::new(handler);
+        // Unbounded so the sender (called synchronously from a tokio task)
+        // never blocks.  Back-pressure comes from the broadcast channel.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Box<[u8]>>();
 
-        // Erase the concrete types into a `Box<dyn Fn(&[u8])>` so it can be
-        // stored in the topic-keyed registry.
-        let erased: PayloadHandler = Box::new(move |payload: &[u8]| {
-            if let Some(event) = T::decode(payload) {
-                let handler = Arc::clone(&handler);
-                tokio::spawn(async move {
+        // One long-lived task per topic — drains the channel and calls handler.
+        tokio::spawn(async move {
+            while let Some(payload) = rx.recv().await {
+                if let Some(event) = T::decode(&payload) {
                     handler(event).await;
-                });
+                }
             }
+        });
+
+        // The trampoline just sends bytes — no Arc::clone, no spawn per msg.
+        let erased: PayloadHandler = Box::new(move |payload: &[u8]| {
+            let _ = tx.send(payload.into());
         });
 
         handler_registry()

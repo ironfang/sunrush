@@ -9,7 +9,7 @@ use crate::messages::BusEvent;
 
 pub mod messages;
 
-const CHANNEL_CAPACITY: usize = 256;
+const CHANNEL_CAPACITY: usize = 256_000;
 
 // ---------------------------------------------------------------------------
 // BusMessage
