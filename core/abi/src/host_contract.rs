@@ -4,7 +4,7 @@ use std::{
     ffi::{CStr, CString},
     future::Future,
     os::raw::{c_char, c_void},
-    sync::{Mutex, OnceLock},
+    sync::{OnceLock, RwLock},
 };
 
 pub type BusCallback = extern "C" fn(topic: *const c_char, data: *const u8, len: usize);
@@ -27,9 +27,9 @@ pub struct HostApi {
 // pointer, so closures cannot be passed directly.
 type PayloadHandler = Box<dyn Fn(&[u8]) + Send + Sync>;
 
-fn handler_registry() -> &'static Mutex<HashMap<String, PayloadHandler>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, PayloadHandler>>> = OnceLock::new();
-    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+fn handler_registry() -> &'static RwLock<HashMap<String, PayloadHandler>> {
+    static REGISTRY: OnceLock<RwLock<HashMap<String, PayloadHandler>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 /// Single trampoline that the host calls for every subscribed topic.
@@ -37,7 +37,8 @@ fn handler_registry() -> &'static Mutex<HashMap<String, PayloadHandler>> {
 extern "C" fn dispatch_trampoline(topic: *const c_char, data: *const u8, len: usize) {
     let topic_str = unsafe { CStr::from_ptr(topic) }.to_str().unwrap_or("");
     let payload = unsafe { std::slice::from_raw_parts(data, len) };
-    if let Ok(registry) = handler_registry().lock() {
+    // read lock: zero contention after startup since handlers are registered once.
+    if let Ok(registry) = handler_registry().read() {
         if let Some(handler) = registry.get(topic_str) {
             handler(payload);
         }
@@ -50,8 +51,26 @@ impl HostApi {
         T: BusEvent,
     {
         let encoded = data.encode();
-        // Keep `c_topic` alive for the duration of the call.
-        let c_topic = CString::new(T::TOPIC).expect("topic contains null byte");
+        // Cache the null-terminated topic string — T::TOPIC is 'static so one
+        // allocation per event type for the lifetime of the process.
+        static TOPIC_CSTR_CACHE: OnceLock<RwLock<HashMap<&'static str, &'static CStr>>> =
+            OnceLock::new();
+        let cache = TOPIC_CSTR_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+
+        // Fast path: already cached → read lock only.
+        let c_topic: &'static CStr = if let Some(&p) = cache.read().unwrap().get(T::TOPIC) {
+            p
+        } else {
+            // Slow path (once per topic type): allocate and leak.
+            let leaked = Box::leak(
+                CString::new(T::TOPIC)
+                    .expect("topic contains null byte")
+                    .into_boxed_c_str(),
+            );
+            cache.write().unwrap().insert(T::TOPIC, leaked);
+            leaked
+        };
+
         (self.bus_publish)(
             self.bus_ctx,
             c_topic.as_ptr(),
@@ -91,7 +110,7 @@ impl HostApi {
         });
 
         handler_registry()
-            .lock()
+            .write()
             .expect("handler registry poisoned")
             .insert(T::TOPIC.to_string(), erased);
 

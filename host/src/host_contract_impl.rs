@@ -1,8 +1,15 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, c_void, c_char};
-use std::sync::{Arc, Mutex};
-use sb::{Bus, BusMessage};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use sb::{Bus, BusMessage, Publisher};
 use abi::host_contract::{BusCallback, HostApi};
+
+/// Per-topic sender cache so `bus_publish` never acquires the Bus topics lock
+/// after the first publish on a given topic.
+fn sender_cache() -> &'static RwLock<HashMap<&'static str, Publisher>> {
+    static CACHE: OnceLock<RwLock<HashMap<&'static str, Publisher>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
 
 fn intern_topic(s: &str) -> &'static str {
     static TABLE: Mutex<Option<HashMap<&'static str, &'static str>>> = Mutex::new(None);
@@ -27,11 +34,22 @@ extern "C" fn bus_publish(
     data: *const u8,
     len: usize,
 ) {
-    let bus = unsafe { &*(bus_ctx as *const Bus) };
     let topic_str = unsafe { CStr::from_ptr(topic) }.to_str().unwrap_or("");
+
+    // Fast path: read lock, no allocation after first publish per topic.
+    if let Some(publisher) = sender_cache().read().unwrap().get(topic_str) {
+        let payload = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
+        publisher.publish(payload);
+        return;
+    }
+
+    // Slow path: first publish for this topic — create and cache the Publisher.
+    let bus = unsafe { &*(bus_ctx as *const Bus) };
     let topic_static = intern_topic(topic_str);
+    let publisher = bus.publisher(topic_static);
     let payload = unsafe { std::slice::from_raw_parts(data, len) }.to_vec();
-    bus.publisher(topic_static).publish(payload);
+    publisher.publish(payload);
+    sender_cache().write().unwrap().insert(topic_static, publisher);
 }
 
 extern "C" fn bus_subscribe(
